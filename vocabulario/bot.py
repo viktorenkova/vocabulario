@@ -114,6 +114,7 @@ class Bot:
 
     async def send(self, chat, text, keyboard=None):
         await chat.send_message(text, parse_mode="HTML", reply_markup=keyboard, disable_web_page_preview=True)
+        logging.getLogger(__name__).info("Reply delivered")
 
     async def begin_search(self, chat, context):
         context.user_data["awaiting_search"] = True
@@ -415,10 +416,13 @@ class Bot:
 
     async def callback(self, update, context):
         q = update.callback_query
-        if not self.authorized(update):
+        authorized = self.authorized(update)
+        try:
             await q.answer()
+        except TelegramError as error:
+            logging.getLogger(__name__).warning("Callback acknowledgement failed: %s", exception_names(error))
+        if not authorized:
             return
-        await q.answer()
         uid, chat = update.effective_user.id, update.effective_chat
         parts = q.data.split(":")
         action = parts[0]

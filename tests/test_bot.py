@@ -4,7 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
-from telegram.error import NetworkError
+import pytest
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application
 
 from vocabulario.bot import SEARCH_LABEL, SEARCH_PROMPT, Bot, card_text
@@ -157,6 +158,37 @@ async def test_search_command_without_query_asks_for_word(tmp_path):
 def test_dictionary_cards_fit_telegram_limit(tmp_path):
     bot = Bot(config(tmp_path))
     assert max(len(card_text(w)) for w in bot.dictionary.ordered) < 4096
+    bot.store.close()
+
+
+@pytest.mark.parametrize("error", [TimedOut(), BadRequest("Query is too old")])
+async def test_word_opens_even_if_callback_acknowledgement_fails(tmp_path, error):
+    bot = Bot(config(tmp_path))
+    word = next(w for w in bot.dictionary.ordered if w["word"] == "gimnasio")
+    chat = SimpleNamespace(id=1, type="private", send_message=AsyncMock())
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1),
+        effective_chat=chat,
+        callback_query=SimpleNamespace(data=f"word:{word['id']}", answer=AsyncMock(side_effect=error)),
+    )
+    await bot.callback(update, SimpleNamespace(user_data={}))
+    assert "<b>gimnasio</b>" in chat.send_message.call_args.args[0]
+    assert bot.store.stats(1)["total"] == 0
+    bot.store.close()
+
+
+async def test_callback_acknowledgement_failure_does_not_bypass_owner_check(tmp_path):
+    bot = Bot(config(tmp_path))
+    word = next(w for w in bot.dictionary.ordered if w["word"] == "gimnasio")
+    chat = SimpleNamespace(id=2, type="private", send_message=AsyncMock())
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=2),
+        effective_chat=chat,
+        callback_query=SimpleNamespace(data=f"add:{word['id']}", answer=AsyncMock(side_effect=TimedOut())),
+    )
+    await bot.callback(update, SimpleNamespace(user_data={}))
+    chat.send_message.assert_not_awaited()
+    assert bot.store.stats(2)["total"] == 0
     bot.store.close()
 
 
