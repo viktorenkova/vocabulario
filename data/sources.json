@@ -1,0 +1,42 @@
+{
+  "dictionary": {
+    "url": "https://raw.githubusercontent.com/doozan/spanish_data/b8ed076b4faea26a0985ee46ca736771c2e62dc4/es-en.data",
+    "revision": "b8ed076b4faea26a0985ee46ca736771c2e62dc4",
+    "sha256": "7cb53827e68a6d8fabcc40c3072adf25c6279500d116bafd3c4a7aad70a0347f"
+  },
+  "sentences": {
+    "url": "https://raw.githubusercontent.com/doozan/spanish_data/b8ed076b4faea26a0985ee46ca736771c2e62dc4/sentences.tsv",
+    "revision": "b8ed076b4faea26a0985ee46ca736771c2e62dc4",
+    "sha256": "c354b63ad897bf719bf3d94e99f9bd6f3fa9989e7fcabd1d08f207f277925663"
+  },
+  "frequency": {
+    "url": "https://raw.githubusercontent.com/doozan/spanish_data/b8ed076b4faea26a0985ee46ca736771c2e62dc4/frequency.csv",
+    "revision": "b8ed076b4faea26a0985ee46ca736771c2e62dc4",
+    "sha256": "f2b644108082e551c7559dc5c33faf4f5bf3e5a59e7598b55f8ba47e35c6ed75"
+  },
+  "ipa": {
+    "url": "https://raw.githubusercontent.com/open-dict-data/ipa-dict/43c3570eb3553bdd19fccd2bd0091534889af023/data/es_ES.txt",
+    "revision": "43c3570eb3553bdd19fccd2bd0091534889af023",
+    "sha256": "5c1f7afc5afcf8083075430fbd31d293d2ab272c78c92a739acc5a5f05caf4b4"
+  },
+  "verbs": {
+    "url": "https://raw.githubusercontent.com/ghidinelli/fred-jehle-spanish-verbs/d4710a83f13d3289bbcacd07d901b7bb3577c129/jehle_verb_database.csv",
+    "revision": "d4710a83f13d3289bbcacd07d901b7bb3577c129",
+    "sha256": "f77f01d536cd351584051d76902ff8051ab1b945a38e69c7ed02da78ab082ea8"
+  },
+  "ipa_license": {
+    "url": "https://raw.githubusercontent.com/open-dict-data/ipa-dict/43c3570eb3553bdd19fccd2bd0091534889af023/LICENSE",
+    "revision": "43c3570eb3553bdd19fccd2bd0091534889af023",
+    "sha256": "2c6a7e4c71f834a8fc0114fa4f65ca85e80bc4b4dc7ed08746963a09a7b0d177"
+  },
+  "verbs_license": {
+    "url": "https://raw.githubusercontent.com/ghidinelli/fred-jehle-spanish-verbs/d4710a83f13d3289bbcacd07d901b7bb3577c129/license.txt",
+    "revision": "d4710a83f13d3289bbcacd07d901b7bb3577c129",
+    "sha256": "929c687378c0d71dd16fc9d8419f2a20e9bc5218d48d6c7589b0ab4b2f415ba4"
+  },
+  "wordnet": {
+    "url": "https://raw.githubusercontent.com/nltk/nltk_data/550b6625bcef1f2abff2ff770a5a0d272c9c6b2a/packages/corpora/wordnet.zip",
+    "revision": "550b6625bcef1f2abff2ff770a5a0d272c9c6b2a",
+    "sha256": "cbda5ea6eef7f36a97a43d4a75f85e07fccbb4f23657d27b4ccbc93e2646ab59"
+  }
+}
