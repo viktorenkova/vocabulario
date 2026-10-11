@@ -22,6 +22,7 @@ from telegram.ext import (
 from .config import Config
 from .dictionary import Dictionary
 from .media import Audio
+from .network import exception_names, telegram_request
 from .schedule import DAY_NAMES, Schedule, due_slot, validate_time
 from .store import Store, utcnow
 
@@ -554,16 +555,16 @@ class Bot:
             await self.prompt(chat, self.config.user_id, context, now=now)
             self.store.mark_delivered(self.config.user_id, date, slot)
         except TelegramError as error:
-            logging.getLogger(__name__).warning("Reminder failed: %s", type(error).__name__)
+            logging.getLogger(__name__).warning("Reminder failed: %s", exception_names(error))
 
     async def shutdown(self, application):
         self.store.close()
 
     async def error(self, update, context):
-        logging.getLogger(__name__).error("Update failed: %s", type(context.error).__name__)
+        logging.getLogger(__name__).error("Update failed: %s", exception_names(context.error))
         if update and self.authorized(update):
             try:
-                await self.send(update.effective_chat, "Не удалось выполнить действие. /review — продолжить.")
+                await self.send(update.effective_chat, "Не удалось выполнить действие. Повторите последнее действие.")
             except TelegramError:
                 pass
 
@@ -571,6 +572,8 @@ class Bot:
         app = (
             Application.builder()
             .token(self.config.token)
+            .request(telegram_request())
+            .get_updates_request(telegram_request(polling=True))
             .concurrent_updates(False)
             .post_shutdown(self.shutdown)
             .build()
@@ -614,7 +617,7 @@ def main():
         raise SystemExit(str(error)) from None
     if not bot.config.user_id:
         logging.getLogger(__name__).warning("ALLOWED_USER_ID пуст: доступна только команда /id.")
-    bot.application().run_polling(allowed_updates=["message", "callback_query"])
+    bot.application().run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=3)
 
 
 if __name__ == "__main__":
