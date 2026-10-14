@@ -62,7 +62,8 @@ HELP = """🇪🇸 Vocabulario — ваш испанский словарь
 
 Откройте карточку → «Учить». В повторении бот показывает значение: напишите испанское слово.
 Регистр не важен, но ñ и ударения обязательны: año ≠ ano, sí ≠ si.
-После 5 верных написаний без подсказок с интервалом ≥24 часов можно нажать «Выучено».
+После 5 верных написаний без подсказок можно нажать «Выучено».
+Засчитываются не более 2 написаний за день, с промежутком не менее 8 часов.
 Выученные слова возвращаются не раньше чем через 30 дней. Ошибка возвращает частое повторение.
 Переводы и примеры в первой версии — на английском."""
 
@@ -80,7 +81,7 @@ def card_text(word, progress=None):
         text += f'\n<a href="{esc(example["source"])}">Tatoeba</a> · {esc(example["attribution"])}'
     text += f'\n\n<a href="{esc(word["source"])}">Wiktionary · CC BY-SA</a>'
     if progress:
-        text += f"\nНаписание: {progress['writing_count']}/5 · " + (
+        text += f"\nЗачтено написаний: {min(progress['writing_count'], 5)}/5 · " + (
             "выучено" if progress["learned"] else "изучается"
         )
     return text
@@ -248,11 +249,11 @@ class Bot:
             rows.append([Button("Спряжение", callback_data=f"verbs:{word_id}")])
         if progress is None:
             rows.append([Button("⭐ Учить", callback_data=f"add:{word_id}")])
-        elif not progress["learned"]:
+        elif not progress["learned"] and progress["writing_count"] >= 5:
             rows.append(
                 [
                     Button(
-                        f"Выучено ({min(5, progress['writing_count'])}/5)", callback_data=f"learned:{word_id}"
+                        "Отметить выученным", callback_data=f"learned:{word_id}"
                     )
                 ]
             )
@@ -300,10 +301,11 @@ class Bot:
             if result["hinted"]:
                 text += " После подсказки написание не засчитывается."
             elif not result["credited"]:
-                text += " В счётчик войдёт следующий ответ спустя 24 часа."
+                ready = result["next_credit"].astimezone(self.config.timezone).strftime("%d.%m %H:%M")
+                text += f" Написание уже зачтено для этого периода. Следующий зачёт возможен с {ready}."
         else:
             text = "Правильный ответ: <b>" + esc(word["word"]) + "</b>. Вернёмся к нему позже."
-        text += f"\nНаписание: {min(result['count'], 5)}/5."
+        text += f"\nЗачтено написаний: {min(result['count'], 5)}/5."
         when = result["due"].astimezone(self.config.timezone).strftime("%d.%m %H:%M")
         text += f"\nСледующее повторение: {when}."
         rows = [
@@ -355,7 +357,7 @@ class Bot:
             await self.send(
                 chat,
                 f"Выбрано: {stats['total']}\nВыучено: {stats['learned']}\n"
-                f"Пора повторить: {stats['due']}\nУспешных написаний с интервалом: {stats['writing']}",
+                f"Пора повторить: {stats['due']}\nЗачтено написаний: {stats['writing']}",
             )
         elif command == "pause":
             self.store.pause(uid)
@@ -500,7 +502,8 @@ class Bot:
                     chat,
                     "Выучено! Следующая проверка не раньше чем через 30 дней."
                     if learned
-                    else "Нужны 5 правильных написаний без подсказки с интервалом ≥24 часа, "
+                    else "Нужны 5 правильных написаний без подсказки: не более 2 за день "
+                    "и не чаще одного раза в 8 часов; "
                     "последний ответ верный и нет открытого вопроса по этому слову.",
                 )
             elif action in {"audio", "image", "verbs", "tense"}:

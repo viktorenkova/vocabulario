@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -61,6 +61,28 @@ async def test_prompt_hides_answer_and_text_grades_it(tmp_path):
     await bot.text(update, context)
     assert bot.store.progress(1, word["id"])["writing_count"] == 1
     assert bot.store.pending(1) is None
+    bot.store.close()
+
+
+async def test_writing_feedback_shows_count_and_next_eligible_time(tmp_path, monkeypatch):
+    bot = Bot(config(tmp_path))
+    word = next(w for w in bot.dictionary.ordered if w["word"] == "casa")
+    morning = datetime(2026, 10, 12, 6, tzinfo=UTC)
+    bot.store.add(1, word["id"], morning)
+    first = bot.store.challenge(1, word["id"], morning)
+    assert bot.store.answer(1, first["id"], "casa", word, morning)["count"] == 1
+    chat = SimpleNamespace(id=1, type="private", send_message=AsyncMock())
+    await bot.show_word(chat, 1, word["id"])
+    assert "Зачтено написаний: 1/5" in chat.send_message.call_args.args[0]
+    assert "Отметить выученным" not in str(chat.send_message.call_args.kwargs["reply_markup"])
+    early = morning + timedelta(hours=2)
+    second = bot.store.challenge(1, word["id"], early)
+    monkeypatch.setattr("vocabulario.store.utcnow", lambda: early)
+    await bot.finish(chat, 1, second, "casa", SimpleNamespace(user_data={}))
+    feedback = chat.send_message.call_args.args[0]
+    assert "Зачтено написаний: 1/5" in feedback
+    assert "Следующий зачёт возможен с 12.10 17:00" in feedback
+    assert "24 часа" not in feedback
     bot.store.close()
 
 

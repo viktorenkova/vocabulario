@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from vocabulario.dictionary import Dictionary, normalize
+from vocabulario.schedule import Schedule
 from vocabulario.store import Store
 
 NOW = datetime(2026, 10, 11, 8, tzinfo=UTC)
@@ -45,6 +46,64 @@ def test_rapid_repeated_answers_do_not_unlock_mastery(store):
         result = store.answer(1, challenge["id"], "casa", WORD, now)
         assert result["count"] == 1
     assert not store.mark_learned(1, "casa", NOW + timedelta(hours=6))
+
+
+def test_morning_and_evening_reach_five_after_three_days(store):
+    store.ensure_schedule(1, Schedule())
+    morning = datetime(2026, 10, 12, 6, tzinfo=UTC)
+    for day, hour in ((0, 0), (0, 11), (1, 0), (1, 11), (2, 0)):
+        now = morning + timedelta(days=day, hours=hour)
+        challenge = store.challenge(1, "casa", now)
+        result = store.answer(1, challenge["id"], "casa", WORD, now)
+        assert result["credited"]
+        if day < 2:
+            assert not store.mark_learned(1, "casa", now)
+    assert store.progress(1, "casa")["writing_count"] == 5
+    assert store.mark_learned(1, "casa", morning + timedelta(days=2))
+
+
+def test_daily_limit_and_eight_hour_gap_use_local_day(store):
+    store.ensure_schedule(1, Schedule())
+    first = datetime(2026, 10, 12, 6, tzinfo=UTC)
+    attempts = (
+        (first, True, 1),
+        (first + timedelta(hours=7), False, 1),
+        (first + timedelta(hours=8), True, 2),
+        (first + timedelta(hours=11), False, 2),
+        (first + timedelta(hours=14), False, 2),
+        (first + timedelta(hours=16), True, 3),
+    )
+    for now, credited, count in attempts:
+        challenge = store.challenge(1, "casa", now)
+        result = store.answer(1, challenge["id"], "casa", WORD, now)
+        assert (result["credited"], result["count"]) == (credited, count)
+        if now == first + timedelta(hours=7):
+            assert result["next_credit"] == first + timedelta(hours=8)
+        if now == first + timedelta(hours=14):
+            assert result["next_credit"] == first + timedelta(hours=16)
+
+
+def test_existing_answers_gain_credit_once_on_upgrade(tmp_path):
+    path = tmp_path / "progress.sqlite3"
+    old = Store(path)
+    old.ensure_schedule(1, Schedule())
+    old.add(1, "casa", NOW)
+    for day, hour in ((0, 0), (0, 11), (1, 0), (1, 11), (2, 0)):
+        now = NOW + timedelta(days=day, hours=hour)
+        challenge = old.challenge(1, "casa", now)
+        old.answer(1, challenge["id"], "casa", WORD, now)
+    with old.db:
+        old.db.execute("UPDATE reviews SET credited=0 WHERE reviewed_at>?", (NOW.isoformat(),))
+        old.db.execute("UPDATE words SET writing_count=1,last_credit=?", (NOW.isoformat(),))
+        old.db.execute("PRAGMA user_version=0")
+    old.close()
+    upgraded = Store(path)
+    assert upgraded.progress(1, "casa")["writing_count"] == 5
+    assert upgraded.db.execute("SELECT SUM(credited) FROM reviews").fetchone()[0] == 5
+    upgraded.close()
+    reopened = Store(path)
+    assert reopened.progress(1, "casa")["writing_count"] == 5
+    reopened.close()
 
 
 def test_marking_mastery_twice_does_not_postpone_review(store):

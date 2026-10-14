@@ -98,7 +98,7 @@ def test_settings_and_deliveries_survive_restart(tmp_path):
     second.close()
 
 
-def test_active_words_return_in_evening_without_double_writing_credit(tmp_path):
+def test_active_words_return_in_evening_with_separate_writing_credit(tmp_path):
     store = Store(tmp_path / "progress.sqlite3")
     store.ensure_schedule(1, Schedule())
     word = {"id": "casa", "word": "casa"}
@@ -108,7 +108,7 @@ def test_active_words_return_in_evening_without_double_writing_credit(tmp_path):
     assert morning["due"] == EVENING
     challenge = store.challenge(1, "casa", EVENING)
     evening = store.answer(1, challenge["id"], "casa", word, EVENING)
-    assert evening["count"] == 1
+    assert evening["count"] == 2
     assert evening["due"] == MORNING + timedelta(days=1)
     store.close()
 

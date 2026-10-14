@@ -2,8 +2,9 @@ import json
 import sqlite3
 import uuid
 from dataclasses import asdict, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fsrs import Card, Rating, Scheduler
 
@@ -13,6 +14,10 @@ from .schedule import Schedule
 
 def utcnow():
     return datetime.now(UTC)
+
+
+MIN_WRITING_GAP = timedelta(hours=8)
+MAX_WRITINGS_PER_DAY = 2
 
 
 class Store:
@@ -55,6 +60,72 @@ class Store:
                 user_id INTEGER NOT NULL, local_date TEXT NOT NULL, slot TEXT NOT NULL,
                 PRIMARY KEY(user_id, local_date, slot));
         """)
+        self._migrate_writing_credits()
+
+    def _zone(self, user_id):
+        schedule = self.schedule(user_id)
+        return ZoneInfo(schedule.timezone) if schedule else UTC
+
+    @staticmethod
+    def _credit_ready_at(now, last_credit, daily_count, zone):
+        ready = now
+        if last_credit:
+            ready = max(ready, last_credit + MIN_WRITING_GAP)
+        if daily_count >= MAX_WRITINGS_PER_DAY:
+            local = now.astimezone(zone)
+            next_day = datetime.combine(local.date() + timedelta(days=1), time.min, zone)
+            ready = max(ready, next_day.astimezone(UTC))
+        return ready
+
+    def _daily_credits(self, user_id, word_id, now, zone):
+        local = now.astimezone(zone)
+        start = datetime.combine(local.date(), time.min, zone).astimezone(UTC)
+        end = datetime.combine(local.date() + timedelta(days=1), time.min, zone).astimezone(UTC)
+        return self.db.execute(
+            "SELECT COUNT(*) FROM reviews WHERE user_id=? AND word_id=? AND credited=1 "
+            "AND reviewed_at>=? AND reviewed_at<?",
+            (user_id, word_id, start.isoformat(), end.isoformat()),
+        ).fetchone()[0]
+
+    def _migrate_writing_credits(self):
+        if self.db.execute("PRAGMA user_version").fetchone()[0] >= 1:
+            return
+        # Old versions kept morning/evening answers but credited only one per 24 hours.
+        rows = self.db.execute(
+            "SELECT challenge_id,user_id,word_id,reviewed_at,correct,hinted,credited "
+            "FROM reviews ORDER BY reviewed_at,challenge_id"
+        ).fetchall()
+        states = {}
+        zones = {}
+        with self.db:
+            for row in rows:
+                key = (row["user_id"], row["word_id"])
+                if key not in states:
+                    states[key] = [None, {}, 0]
+                last, daily, count = states[key]
+                now = datetime.fromisoformat(row["reviewed_at"])
+                zone = zones.setdefault(row["user_id"], self._zone(row["user_id"]))
+                day = now.astimezone(zone).date()
+                credited = bool(
+                    row["correct"] and not row["hinted"]
+                    and self._credit_ready_at(now, last, daily.get(day, 0), zone) == now
+                )
+                if credited:
+                    daily[day] = daily.get(day, 0) + 1
+                    states[key] = [now, daily, count + 1]
+                if credited != bool(row["credited"]):
+                    self.db.execute(
+                        "UPDATE reviews SET credited=? WHERE challenge_id=?",
+                        (int(credited), row["challenge_id"]),
+                    )
+            for (user_id, word_id), (last, _, count) in states.items():
+                progress = self.progress(user_id, word_id)
+                if progress and count > progress["writing_count"]:
+                    self.db.execute(
+                        "UPDATE words SET writing_count=?,last_credit=? WHERE user_id=? AND word_id=?",
+                        (count, last.isoformat(), user_id, word_id),
+                    )
+            self.db.execute("PRAGMA user_version=1")
 
     def ensure_schedule(self, user_id, schedule):
         with self.db:
@@ -226,7 +297,10 @@ class Store:
             correct = not skipped and normalize(answer) == normalize(word["word"])
             unaided = correct and not challenge["hinted"]
             last_credit = datetime.fromisoformat(progress["last_credit"]) if progress["last_credit"] else None
-            credited = unaided and (last_credit is None or now - last_credit >= timedelta(hours=24))
+            zone = self._zone(user_id)
+            daily_count = self._daily_credits(user_id, word["id"], now, zone)
+            next_credit = self._credit_ready_at(now, last_credit, daily_count, zone)
+            credited = unaided and next_credit == now
             count = progress["writing_count"] + int(credited)
             rating = Rating.Good if unaided else Rating.Again
             card, log = self.scheduler.review_card(
@@ -241,6 +315,8 @@ class Store:
                     card.due = min(card.due, next_session)
                 elif count < 5:
                     card.due = min(card.due, now + timedelta(days=1))
+                if not credited:
+                    card.due = max(card.due, next_credit)
             if learned:
                 card.due = max(card.due, now + timedelta(days=30))
             self.db.execute(
@@ -278,6 +354,7 @@ class Store:
             "count": count,
             "due": card.due,
             "learned": learned,
+            "next_credit": next_credit if not credited and unaided else None,
         }
 
     def mark_learned(self, user_id, word_id, now=None):
