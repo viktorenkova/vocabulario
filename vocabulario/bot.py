@@ -1,6 +1,7 @@
 import html
 import io
 import logging
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -24,7 +25,7 @@ from .dictionary import Dictionary
 from .media import Audio
 from .network import exception_names, telegram_request
 from .schedule import DAY_NAMES, Schedule, due_slot, validate_time
-from .store import Store, utcnow
+from .store import Store, maintenance_label, utcnow
 
 SEARCH_LABEL = "🔎 Найти слово"
 REVIEW_LABEL = "📚 Повторить"
@@ -64,7 +65,8 @@ HELP = """🇪🇸 Vocabulario — ваш испанский словарь
 Регистр не важен, но ñ и ударения обязательны: año ≠ ano, sí ≠ si.
 После 5 верных написаний без подсказок можно нажать «Выучено».
 Засчитываются не более 2 написаний за день, с промежутком не менее 8 часов.
-Выученные слова возвращаются не раньше чем через 30 дней. Ошибка возвращает частое повторение.
+Выученные слова: 4 еженедельные проверки, затем 4 проверки раз в две недели, потом раз в месяц.
+Кнопка «Учить заново» возвращает слово в частые повторы. Ошибка тоже возвращает его туда.
 Переводы и примеры в первой версии — на английском."""
 
 
@@ -249,6 +251,10 @@ class Bot:
             rows.append([Button("Спряжение", callback_data=f"verbs:{word_id}")])
         if progress is None:
             rows.append([Button("⭐ Учить", callback_data=f"add:{word_id}")])
+        elif progress["learned"]:
+            pending = self.store.pending(user_id)
+            if not pending or pending["word_id"] != word_id:
+                rows.append([Button("↩️ Учить заново", callback_data=f"relearn:{word_id}")])
         elif not progress["learned"] and progress["writing_count"] >= 5:
             rows.append(
                 [
@@ -260,7 +266,11 @@ class Bot:
         rows.append(
             [Button(SEARCH_LABEL, callback_data="search"), Button("Повторить", callback_data="review")]
         )
-        await self.send(chat, card_text(word, progress), Keyboard(rows))
+        text = card_text(word, progress)
+        if progress and progress["learned"]:
+            due = datetime.fromisoformat(progress["due"]).astimezone(self.config.timezone)
+            text += f"\nПроверка {maintenance_label(progress['maintenance_step'])}: {due:%d.%m %H:%M}."
+        await self.send(chat, text, Keyboard(rows))
 
     async def prompt(self, chat, user_id, context, now=None):
         pending = self.store.pending(user_id)
@@ -280,6 +290,9 @@ class Bot:
             await self.send(chat, "Верните прежний словарь: в прогрессе есть отсутствующее слово.")
             return
         text = "✍️ <b>Напишите по-испански</b>\n" + "\n".join(esc(m[:240]) for m in word["meanings"])
+        progress = self.store.progress(user_id, word["id"])
+        if progress["learned"]:
+            text += f"\n🌱 Проверка выученного слова · {maintenance_label(progress['maintenance_step'])}."
         text += f"\nЧасть речи: {esc(word['pos'])}\n\nБез артикля, если он не входит в само выражение."
         rows = [
             [
@@ -296,7 +309,9 @@ class Bot:
             await self.send(chat, "Этот вопрос уже завершён.")
             return
         context.user_data["session_count"] = context.user_data.get("session_count", 0) + 1
-        if result["correct"]:
+        if result["was_learned"] and result["learned"]:
+            text = "✅ Верно! Слово остаётся выученным."
+        elif result["correct"]:
             text = "✅ Верно!"
             if result["hinted"]:
                 text += " После подсказки написание не засчитывается."
@@ -305,12 +320,19 @@ class Bot:
                 text += f" Написание уже зачтено для этого периода. Следующий зачёт возможен с {ready}."
         else:
             text = "Правильный ответ: <b>" + esc(word["word"]) + "</b>. Вернёмся к нему позже."
-        text += f"\nЗачтено написаний: {min(result['count'], 5)}/5."
+        if result["was_learned"] and not result["learned"]:
+            text += " Слово снова в частых повторах; новый цикл — 0/5."
+        elif result["learned"]:
+            text += f"\nРежим: {maintenance_label(result['maintenance_step'])}."
+        else:
+            text += f"\nЗачтено написаний: {min(result['count'], 5)}/5."
         when = result["due"].astimezone(self.config.timezone).strftime("%d.%m %H:%M")
         text += f"\nСледующее повторение: {when}."
         rows = [
             [Button("Дальше →", callback_data="next"), Button("Карточка", callback_data=f"word:{word['id']}")]
         ]
+        if result["learned"]:
+            rows.append([Button("↩️ Учить заново", callback_data=f"relearn:{word['id']}")])
         if result["count"] >= 5 and result["correct"] and not result["hinted"] and not result["learned"]:
             rows.append([Button("Отметить выученным", callback_data=f"learned:{word['id']}")])
         await self.send(chat, text, Keyboard(rows))
@@ -498,13 +520,29 @@ class Bot:
                 await self.send(chat, "Добавлено! /review — начать." if added else "Слово уже в изучении.")
             elif action == "learned":
                 learned = self.store.mark_learned(uid, wid)
+                progress = self.store.progress(uid, wid)
                 await self.send(
                     chat,
-                    "Выучено! Следующая проверка не раньше чем через 30 дней."
+                    "Выучено! Следующая проверка "
+                    f"{datetime.fromisoformat(progress['due']).astimezone(self.config.timezone):%d.%m %H:%M} "
+                    f"({maintenance_label(progress['maintenance_step'])})."
                     if learned
                     else "Нужны 5 правильных написаний без подсказки: не более 2 за день "
                     "и не чаще одного раза в 8 часов; "
                     "последний ответ верный и нет открытого вопроса по этому слову.",
+                )
+            elif action == "relearn":
+                due = self.store.return_to_learning(uid, wid)
+                progress = self.store.progress(uid, wid)
+                await self.send(
+                    chat,
+                    f"Слово снова в частых повторах. Новый цикл: 0/5. "
+                    f"Ближайший вопрос: {due.astimezone(self.config.timezone):%d.%m %H:%M}."
+                    if due else (
+                        "Слово уже в частых повторах."
+                        if progress and not progress["learned"]
+                        else "Сначала завершите текущий вопрос по этому слову."
+                    ),
                 )
             elif action in {"audio", "image", "verbs", "tense"}:
                 self.store.reveal_word(uid, wid)

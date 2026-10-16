@@ -3,10 +3,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from fsrs import Card
 
 from vocabulario.dictionary import Dictionary, normalize
 from vocabulario.schedule import Schedule
-from vocabulario.store import Store
+from vocabulario.store import Store, maintenance_due, maintenance_label
 
 NOW = datetime(2026, 10, 11, 8, tzinfo=UTC)
 WORD = {"id": "casa", "word": "casa"}
@@ -36,7 +37,9 @@ def test_five_spaced_written_answers_required(store):
     assert store.mark_learned(1, "casa", NOW + timedelta(days=4))
     progress = store.progress(1, "casa")
     assert progress["learned"]
-    assert datetime.fromisoformat(progress["due"]) >= NOW + timedelta(days=34)
+    assert datetime.fromisoformat(progress["due"]) == NOW + timedelta(days=11)
+    assert progress["maintenance_step"] == 0
+    assert progress["learned_at"] == (NOW + timedelta(days=4)).isoformat()
 
 
 def test_rapid_repeated_answers_do_not_unlock_mastery(store):
@@ -115,6 +118,93 @@ def test_marking_mastery_twice_does_not_postpone_review(store):
     assert store.progress(1, "casa")["due"] == original_due
 
 
+def test_learned_word_moves_through_weekly_biweekly_and_monthly_checks(store):
+    for day in range(5):
+        review(store, day)
+    marked = NOW + timedelta(days=4)
+    assert store.mark_learned(1, "casa", marked)
+    offsets = (7, 14, 21, 28, 42, 56, 70, 84)
+    for step, days in enumerate(offsets, start=1):
+        due = marked + timedelta(days=days)
+        assert datetime.fromisoformat(store.progress(1, "casa")["due"]) == due
+        assert store.due(1, due - timedelta(seconds=1)) == []
+        assert store.due(1, due)[0]["word_id"] == "casa"
+        challenge = store.challenge(1, "casa", due)
+        result = store.answer(1, challenge["id"], "casa", WORD, due)
+        assert result["learned"]
+        assert result["maintenance_step"] == step
+        expected_next = (
+            marked + timedelta(days=offsets[step])
+            if step < len(offsets)
+            else maintenance_due(due, 8, UTC)
+        )
+        assert result["due"] == expected_next
+        assert store.mark_learned(1, "casa", expected_next)
+        assert datetime.fromisoformat(store.progress(1, "casa")["due"]) == expected_next
+    monthly = datetime(2027, 2, 7, 8, tzinfo=UTC)
+    assert datetime.fromisoformat(store.progress(1, "casa")["due"]) == monthly
+    challenge = store.challenge(1, "casa", monthly)
+    assert store.answer(1, challenge["id"], "casa", WORD, monthly)["due"] == datetime(
+        2027, 3, 7, 8, tzinfo=UTC
+    )
+    assert maintenance_label(0) == maintenance_label(3) == "раз в неделю"
+    assert maintenance_label(4) == maintenance_label(7) == "раз в 2 недели"
+    assert maintenance_label(8) == "раз в месяц"
+
+
+def test_monthly_check_uses_calendar_month():
+    assert maintenance_due(datetime(2027, 1, 31, 9, tzinfo=UTC), 8, UTC) == datetime(
+        2027, 2, 28, 9, tzinfo=UTC
+    )
+
+
+def test_return_learned_word_to_frequent_reviews_starts_new_writing_cycle(store):
+    store.ensure_schedule(1, Schedule())
+    for day in range(5):
+        review(store, day)
+    marked = NOW + timedelta(days=4)
+    assert store.mark_learned(1, "casa", marked)
+    due = store.return_to_learning(1, "casa", marked + timedelta(days=1))
+    progress = store.progress(1, "casa")
+    assert due == datetime.fromisoformat(progress["due"])
+    assert due > marked + timedelta(days=1)
+    assert not progress["learned"] and progress["writing_count"] == 0
+    assert progress["maintenance_step"] == 0 and progress["learned_at"] is None
+    assert store.return_to_learning(1, "casa", marked + timedelta(days=1)) is None
+    assert not store.mark_learned(1, "casa", marked + timedelta(days=1))
+    assert store.db.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 5
+
+
+def test_existing_learned_word_gets_first_weekly_check_once(tmp_path):
+    path = tmp_path / "progress.sqlite3"
+    old = Store(path)
+    old.add(1, "casa", NOW)
+    for day in range(5):
+        review(old, day)
+    marked = NOW + timedelta(days=4, seconds=2)
+    assert old.mark_learned(1, "casa", marked)
+    card = old.progress(1, "casa")["card"]
+    old_card = Card.from_json(card)
+    old_card.due = marked + timedelta(days=30)
+    with old.db:
+        old.db.execute(
+            "UPDATE words SET due=?,card=?,learned_at=NULL WHERE user_id=1 AND word_id='casa'",
+            (old_card.due.isoformat(), old_card.to_json()),
+        )
+        old.db.execute("PRAGMA user_version=1")
+    old.close()
+    upgraded = Store(path)
+    progress = upgraded.progress(1, "casa")
+    assert upgraded.db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert progress["learned"] and progress["writing_count"] == 5
+    assert progress["maintenance_step"] == 0
+    assert datetime.fromisoformat(progress["due"]) == marked + timedelta(days=7)
+    upgraded.close()
+    reopened = Store(path)
+    assert reopened.progress(1, "casa")["due"] == progress["due"]
+    reopened.close()
+
+
 def test_hint_and_dictionary_reveal_do_not_count(store):
     assert review(store, hinted=True)["count"] == 0
     challenge = store.challenge(1, "casa", NOW + timedelta(days=1))
@@ -142,11 +232,24 @@ def test_error_after_mastery_returns_to_active_learning(store):
     for day in range(5):
         review(store, day)
     assert store.mark_learned(1, "casa", NOW + timedelta(days=4))
-    result = review(store, 34, "caso")
+    result = review(store, 11, "caso")
     assert not result["correct"]
     assert not result["learned"]
-    assert result["due"] == NOW + timedelta(days=34, minutes=10)
-    assert not store.mark_learned(1, "casa", NOW + timedelta(days=34))
+    assert result["due"] == NOW + timedelta(days=11, minutes=10)
+    assert result["count"] == 0
+    assert store.progress(1, "casa")["maintenance_step"] == 0
+    assert not store.mark_learned(1, "casa", NOW + timedelta(days=11))
+
+
+def test_hint_on_learned_check_also_returns_to_frequent_reviews(store):
+    for day in range(5):
+        review(store, day)
+    assert store.mark_learned(1, "casa", NOW + timedelta(days=4))
+    result = review(store, 11, hinted=True)
+    assert result["correct"] and result["hinted"]
+    assert not result["learned"] and result["count"] == 0
+    assert result["due"] == NOW + timedelta(days=11, minutes=10)
+    assert store.db.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 6
 
 
 @pytest.mark.parametrize(("target", "answer"), [("año", "ano"), ("sí", "si"), ("papá", "papa")])

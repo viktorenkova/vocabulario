@@ -86,6 +86,51 @@ async def test_writing_feedback_shows_count_and_next_eligible_time(tmp_path, mon
     bot.store.close()
 
 
+async def test_learned_card_check_and_return_button(tmp_path, monkeypatch):
+    bot = Bot(config(tmp_path))
+    word = next(w for w in bot.dictionary.ordered if w["word"] == "casa")
+    base = datetime(2026, 10, 11, 6, tzinfo=UTC)
+    bot.store.add(1, word["id"], base)
+    for day in range(5):
+        now = base + timedelta(days=day)
+        challenge = bot.store.challenge(1, word["id"], now)
+        bot.store.answer(1, challenge["id"], "casa", word, now)
+    marked = base + timedelta(days=4)
+    assert bot.store.mark_learned(1, word["id"], marked)
+    chat = SimpleNamespace(id=1, type="private", send_message=AsyncMock())
+    await bot.show_word(chat, 1, word["id"])
+    assert "Проверка раз в неделю" in chat.send_message.call_args.args[0]
+    assert "Учить заново" in str(chat.send_message.call_args.kwargs["reply_markup"])
+
+    foreign_chat = SimpleNamespace(id=2, type="private", send_message=AsyncMock())
+    foreign_query = SimpleNamespace(data=f"relearn:{word['id']}", answer=AsyncMock())
+    foreign = SimpleNamespace(
+        effective_user=SimpleNamespace(id=2), effective_chat=foreign_chat, callback_query=foreign_query
+    )
+    await bot.callback(foreign, SimpleNamespace(user_data={}))
+    assert bot.store.progress(1, word["id"])["learned"]
+    foreign_chat.send_message.assert_not_awaited()
+
+    due = marked + timedelta(days=7)
+    bot.store.challenge(1, word["id"], due)
+    await bot.prompt(chat, 1, SimpleNamespace(user_data={}), now=due)
+    assert "Проверка выученного слова" in chat.send_message.call_args.args[0]
+    monkeypatch.setattr("vocabulario.store.utcnow", lambda: due)
+    await bot.finish(chat, 1, bot.store.pending(1), "casa", SimpleNamespace(user_data={}))
+    assert "Слово остаётся выученным" in chat.send_message.call_args.args[0]
+    assert "Учить заново" in str(chat.send_message.call_args.kwargs["reply_markup"])
+
+    returned_at = due + timedelta(days=1)
+    monkeypatch.setattr("vocabulario.store.utcnow", lambda: returned_at)
+    query = SimpleNamespace(data=f"relearn:{word['id']}", answer=AsyncMock())
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_chat=chat, callback_query=query)
+    await bot.callback(update, SimpleNamespace(user_data={}))
+    assert "Новый цикл: 0/5" in chat.send_message.call_args.args[0]
+    assert not bot.store.progress(1, word["id"])["learned"]
+    assert bot.store.progress(1, word["id"])["writing_count"] == 0
+    bot.store.close()
+
+
 async def test_foreign_user_cannot_read_or_mutate(tmp_path):
     bot = Bot(config(tmp_path))
     chat = SimpleNamespace(id=2, type="private", send_message=AsyncMock())

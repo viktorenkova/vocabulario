@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import uuid
+from calendar import monthrange
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -18,6 +19,26 @@ def utcnow():
 
 MIN_WRITING_GAP = timedelta(hours=8)
 MAX_WRITINGS_PER_DAY = 2
+
+
+def maintenance_label(step):
+    if step < 4:
+        return "раз в неделю"
+    if step < 8:
+        return "раз в 2 недели"
+    return "раз в месяц"
+
+
+def maintenance_due(now, step, zone):
+    if step < 4:
+        return now + timedelta(days=7)
+    if step < 8:
+        return now + timedelta(days=14)
+    local = now.astimezone(zone)
+    year = local.year + (local.month == 12)
+    month = local.month % 12 + 1
+    day = min(local.day, monthrange(year, month)[1])
+    return local.replace(year=year, month=month, day=day).astimezone(UTC)
 
 
 class Store:
@@ -61,6 +82,42 @@ class Store:
                 PRIMARY KEY(user_id, local_date, slot));
         """)
         self._migrate_writing_credits()
+        self._migrate_learned_schedule()
+
+    def _migrate_learned_schedule(self):
+        if self.db.execute("PRAGMA user_version").fetchone()[0] >= 2:
+            return
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(words)")}
+        with self.db:
+            if "learned_at" not in columns:
+                self.db.execute("ALTER TABLE words ADD COLUMN learned_at TEXT")
+            if "maintenance_step" not in columns:
+                self.db.execute(
+                    "ALTER TABLE words ADD COLUMN maintenance_step INTEGER NOT NULL DEFAULT 0"
+                )
+            for row in self.db.execute(
+                "SELECT user_id,word_id,card,due FROM words WHERE learned=1"
+            ).fetchall():
+                # The old rule set the first check to at least 30 days after marking learned.
+                # The last review is a lower bound when FSRS had set an even later date.
+                anchor = datetime.fromisoformat(row["due"]) - timedelta(days=30)
+                last = self.db.execute(
+                    "SELECT reviewed_at FROM reviews WHERE user_id=? AND word_id=? "
+                    "ORDER BY reviewed_at DESC LIMIT 1",
+                    (row["user_id"], row["word_id"]),
+                ).fetchone()
+                if last:
+                    anchor = max(anchor, datetime.fromisoformat(last["reviewed_at"]))
+                anchor = min(anchor, utcnow())
+                due = maintenance_due(anchor, 0, self._zone(row["user_id"]))
+                card = Card.from_json(row["card"])
+                card.due = due
+                self.db.execute(
+                    "UPDATE words SET learned_at=?,maintenance_step=0,card=?,due=? "
+                    "WHERE user_id=? AND word_id=?",
+                    (anchor.isoformat(), card.to_json(), due.isoformat(), row["user_id"], row["word_id"]),
+                )
+            self.db.execute("PRAGMA user_version=2")
 
     def _zone(self, user_id):
         schedule = self.schedule(user_id)
@@ -306,8 +363,13 @@ class Store:
             card, log = self.scheduler.review_card(
                 Card.from_json(progress["card"]), rating, review_datetime=now
             )
-            learned = bool(progress["learned"]) and unaided
-            # Product policy: frequent practice until the writing gate, monthly maintenance after mastery.
+            was_learned = bool(progress["learned"])
+            learned = was_learned and unaided
+            maintenance_step = progress["maintenance_step"] + 1 if learned else 0
+            learned_at = progress["learned_at"] if learned else None
+            if was_learned and not learned:
+                count = 0
+            # Active words return frequently; learned words follow fixed maintenance stages.
             if unaided and not learned:
                 schedule = self.schedule(user_id)
                 next_session = schedule.next_session(now) if schedule else None
@@ -318,9 +380,10 @@ class Store:
                 if not credited:
                     card.due = max(card.due, next_credit)
             if learned:
-                card.due = max(card.due, now + timedelta(days=30))
+                card.due = maintenance_due(now, maintenance_step, zone)
             self.db.execute(
-                """UPDATE words SET card=?,due=?,writing_count=?,last_credit=?,learned=?
+                """UPDATE words SET card=?,due=?,writing_count=?,last_credit=?,learned=?,
+                learned_at=?,maintenance_step=?
                 WHERE user_id=? AND word_id=?""",
                 (
                     card.to_json(),
@@ -328,6 +391,8 @@ class Store:
                     count,
                     now.isoformat() if credited else progress["last_credit"],
                     int(learned),
+                    learned_at,
+                    maintenance_step,
                     user_id,
                     word["id"],
                 ),
@@ -354,6 +419,8 @@ class Store:
             "count": count,
             "due": card.due,
             "learned": learned,
+            "was_learned": was_learned,
+            "maintenance_step": maintenance_step,
             "next_credit": next_credit if not credited and unaided else None,
         }
 
@@ -375,13 +442,41 @@ class Store:
         if pending and pending["word_id"] == word_id:
             return False
         card = Card.from_json(progress["card"])
-        card.due = max(card.due, now + timedelta(days=30))
+        card.due = maintenance_due(now, 0, self._zone(user_id))
         with self.db:
             self.db.execute(
-                "UPDATE words SET learned=1,card=?,due=? WHERE user_id=? AND word_id=?",
-                (card.to_json(), card.due.isoformat(), user_id, word_id),
+                "UPDATE words SET learned=1,learned_at=?,maintenance_step=0,card=?,due=? "
+                "WHERE user_id=? AND word_id=?",
+                (now.isoformat(), card.to_json(), card.due.isoformat(), user_id, word_id),
             )
         return True
+
+    def return_to_learning(self, user_id, word_id, now=None):
+        now = now or utcnow()
+        progress = self.progress(user_id, word_id)
+        if not progress or not progress["learned"]:
+            return None
+        pending = self.pending(user_id)
+        if pending and pending["word_id"] == word_id:
+            return None
+        schedule = self.schedule(user_id)
+        next_session = schedule.next_session(now) if schedule else None
+        last_credit = datetime.fromisoformat(progress["last_credit"]) if progress["last_credit"] else None
+        zone = self._zone(user_id)
+        daily_count = self._daily_credits(user_id, word_id, now, zone)
+        due = max(
+            next_session or now + timedelta(days=1),
+            self._credit_ready_at(now, last_credit, daily_count, zone),
+        )
+        card = Card.from_json(progress["card"])
+        card.due = due
+        with self.db:
+            self.db.execute(
+                "UPDATE words SET learned=0,learned_at=NULL,maintenance_step=0,writing_count=0,"
+                "card=?,due=? WHERE user_id=? AND word_id=?",
+                (card.to_json(), due.isoformat(), user_id, word_id),
+            )
+        return due
 
     def stats(self, user_id, now=None):
         return dict(
